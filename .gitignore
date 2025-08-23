@@ -1,0 +1,46 @@
+
+# ---- CMake ----
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+install_manifest.txt
+
+# ---- Build directories ----
+build/
+out/
+bin/
+lib/
+
+# ---- clangd ----
+.cache/
+.clangd/
+.vscode/
+
+# ---- Compiled Object files ----
+*.o
+*.lo
+*.la
+*.al
+*.obj
+*.gch
+*.pch
+
+# ---- Compiled Dynamic libraries ----
+*.so
+*.dylib
+*.dll
+
+# ---- Compiled Static libraries ----
+*.a
+*.lib
+
+# ---- Executables ----
+*.exe
+*.out
+*.app
+
+# ---- IDE / Editor ----
+.
+
+.cache/
