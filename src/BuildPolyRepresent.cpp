@@ -48,57 +48,62 @@ static void collectPerfectBand(affine::AffineForOp root,
         for (Operation &op : *body) {
             if (isa<affine::AffineYieldOp>(op)) continue;
             ++count;
-            if (count == 1)
-                if (auto next = dyn_cast<affine::AffineForOp>(op)) inner = next;
+            if (count == 1) {
+                if (auto next = dyn_cast<affine::AffineForOp>(op)) {
+                    inner = next;
+                }
+            }
         }
 
-        if (count == 1 && inner)
+        if (count == 1 && inner) {
             cur = inner;  // perfect 嵌套，继续向内
-        else
+        } else {
             break;  // 非 perfect，结束
+        }
     }
 }
 
 /// 为一个 band 构建 FlatLinearValueConstraints:
-/// - band 每层 iv 作为 dim;
-/// - 上下界 map 的非 iv 操作数作为 symbol;
+/// - band 每层 induction_variable（归纳变量） 作为 dim;
+/// - 上下界 map 的非 induction_variable 操作数作为 symbol;
 /// - computeAlignedMap 对齐后，用 addBound(LB/UB) 加入约束。
-static LogicalResult buildFLVCForBand(ArrayRef<affine::AffineForOp> band,
-                                      FlatLinearValueConstraints &vlc) {
+static LogicalResult buildFLVConstraintsForBand(
+    ArrayRef<affine::AffineForOp> band, FlatLinearValueConstraints &linear_value_constraints) {
     if (band.empty()) {
         return failure();
     }
 
-    vlc = FlatLinearValueConstraints();
+    linear_value_constraints = FlatLinearValueConstraints();
 
     // dims = 所有 iv(外到内保序)
-    SmallVector<Value, 8> dimIVs;
-    dimIVs.reserve(band.size());
+    SmallVector<Value, 8> induction_variable_dims;
+    induction_variable_dims.reserve(band.size());
     for (auto forOp : band) {
-        dimIVs.push_back(forOp.getInductionVar());
+        induction_variable_dims.push_back(forOp.getInductionVar());
     }
 
-    vlc.appendDimVar(ValueRange(dimIVs));
+    // 注册为 维度变量（dims）
+    linear_value_constraints.appendDimVar(ValueRange(induction_variable_dims));
 
-    // symbols = 所有上下界 map 中的 非 iv 操作数
-    llvm::DenseSet<Value> ivSet;
-    ivSet.reserve(dimIVs.size());
-    for (Value v : dimIVs) {
-        ivSet.insert(v);
+    // symbols = 所有上下界 map 中的 非 iv 操作数 比如外层 iv、shape 符号、block 参数
+    llvm::DenseSet<Value> induction_variable_set;
+    induction_variable_set.reserve(induction_variable_dims.size());
+    for (Value v : induction_variable_dims) {
+        induction_variable_set.insert(v);
     }
 
-    llvm::DenseSet<Value> symSet;
+    llvm::DenseSet<Value> symbol_set;
     auto collectSymbol = [&](ValueRange ops) {
         for (Value v : ops) {
             if (!v) {
                 continue;
             }
 
-            if (ivSet.contains(v)) {
+            if (induction_variable_set.contains(v)) {
                 continue;
             }
 
-            symSet.insert(v);
+            symbol_set.insert(v);
         }
     };
     for (auto forOp : band) {
@@ -106,10 +111,14 @@ static LogicalResult buildFLVCForBand(ArrayRef<affine::AffineForOp> band,
         collectSymbol(forOp.getUpperBoundOperands());
     }
 
-    SmallVector<Value, 8> symVals;
-    symVals.reserve(symSet.size());
-    for (Value v : symSet) symVals.push_back(v);
-    if (!symVals.empty()) vlc.appendSymbolVar(ValueRange(symVals));
+    SmallVector<Value, 8> symbol_vals;
+    symbol_vals.reserve(symbol_set.size());
+    for (Value v : symbol_set) {
+        symbol_vals.push_back(v);
+    }
+    if (!symbol_vals.empty()) {
+        linear_value_constraints.appendSymbolVar(ValueRange(symbol_vals));
+    }
 
     //  加上下界
     for (unsigned pos = 0; pos < band.size(); ++pos) {
@@ -117,13 +126,19 @@ static LogicalResult buildFLVCForBand(ArrayRef<affine::AffineForOp> band,
 
         // LB(默认闭)
         AffineMap lbMap = forOp.getLowerBoundMap();
-        AffineMap lbAligned = vlc.computeAlignedMap(lbMap, forOp.getLowerBoundOperands());
-        (void)vlc.addBound(presburger::BoundType::LB, /*pos=*/pos, lbAligned);
+
+        // 把 map “对齐”到当前 VLC 的变量顺序（先 dims=各层 iv，再 symbols=外部参数），确保后面能把
+        // map 的线性式落在同一套变量上；
+        AffineMap lbAligned =
+            linear_value_constraints.computeAlignedMap(lbMap, forOp.getLowerBoundOperands());
+        // 再调用 addBound(LB/UB, pos, alignedMap) 加入约束。
+        (void)linear_value_constraints.addBound(presburger::BoundType::LB, pos, lbAligned);
 
         // UB(默认开)
         AffineMap ubMap = forOp.getUpperBoundMap();
-        AffineMap ubAligned = vlc.computeAlignedMap(ubMap, forOp.getUpperBoundOperands());
-        (void)vlc.addBound(presburger::BoundType::UB, /*pos=*/pos, ubAligned);
+        AffineMap ubAligned =
+            linear_value_constraints.computeAlignedMap(ubMap, forOp.getUpperBoundOperands());
+        (void)linear_value_constraints.addBound(presburger::BoundType::UB, pos, ubAligned);
 
         // step:此处先不显式编码整除关系;必要时用 local 等式引入。
         (void)forOp.getStep();
@@ -164,24 +179,24 @@ struct BuildPolyRepresentPass
                              << forOp.getUpperBoundMap() << ") step " << forOp.getStep() << "\n";
             }
 
-            FlatLinearValueConstraints vlc;
-            if (failed(buildFLVCForBand(band, vlc))) {
+            FlatLinearValueConstraints linear_value_constraints;
+            if (failed(buildFLVConstraintsForBand(band, linear_value_constraints))) {
                 llvm::errs() << " 构建约束失败。\n";
                 continue;
             }
 
             // 使用 getNum*Vars()
-            llvm::errs() << "  约束概要:dims=" << vlc.getNumDimVars()
-                         << ", symbols=" << vlc.getNumSymbolVars()
-                         << ", locals=" << vlc.getNumLocalVars()
-                         << ", 等式=" << vlc.getNumEqualities()
-                         << ", 不等式=" << vlc.getNumInequalities() << "\n";
+            llvm::errs() << "  约束概要:dims=" << linear_value_constraints.getNumDimVars()
+                         << ", symbols=" << linear_value_constraints.getNumSymbolVars()
+                         << ", locals=" << linear_value_constraints.getNumLocalVars()
+                         << ", 等式=" << linear_value_constraints.getNumEqualities()
+                         << ", 不等式=" << linear_value_constraints.getNumInequalities() << "\n";
 
             llvm::errs() << "  详细矩阵(行=约束;列=dim/sym/local + 常数):\n";
-            vlc.dump();
+            linear_value_constraints.dump();
 
             // 打印 dim ↔ SSA 名
-            auto dims = vlc.getMaybeValues(mlir::presburger::VarKind::SetDim);
+            auto dims = linear_value_constraints.getMaybeValues(mlir::presburger::VarKind::SetDim);
             for (unsigned i = 0; i < dims.size(); ++i) {
                 if (dims[i]) {
                     llvm::errs() << "  d" << i << " <- " << *dims[i] << "\n";

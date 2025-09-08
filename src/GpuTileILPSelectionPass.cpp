@@ -5,23 +5,8 @@
 //   将多面体分析得到的迭代域与依赖提示融合进整数线性规划模型,
 //   使用 OR-Tools 的 CP-SAT 求解分块大小集合 {T_i}, 并写回属性 "tile.sizes".
 //
-// 多面体信息的获取途径(两级回退):
-//   1) 首选: 读取其它分析 Pass 写入的属性, 例如:
-//      - "poly.extents"            : ArrayAttr(IntegerAttr)
-//      表示每层理论迭代次数上界 E_i.
-//      - "poly.depend.dirs"        : ArrayAttr(StringAttr)
-//      表示每层是否存在严格方向("<",">"),
-//                                    或 "=","*" 等提示, 用于调权或收紧上界.
-//      - "poly.sm.coeffs"          : ArrayAttr(IntegerAttr)
-//      表示共享内存线性系数 c_i. 若存在则直接采用, 使该 Pass 与你的
-//      BuildPolyRepresent/BuildPolyDepend 对接.
-//   2) 回退: 若未提供属性, 则在本 Pass 内做保守估计:
-//      - 从 affine.for 的上下界常量解析 E_i, 失败则使用回退上界.
-//      - 遍历带内的 AffineLoad/AffineStore, 对每个 memref
-//      用线性化的保守系数估计共享内存.
-//      - 依赖提示采用“越内层权重越大”的稳健缺省.
-//
- 
+
+
 //
 //===----------------------------------------------------------------------===//
 
@@ -51,6 +36,10 @@ using namespace mlir;
 
 namespace {
 
+/// @brief 从一个最外层 affine.for 开始，判断并收集完美嵌套（perfectly nested）的内层 affine.for
+/// 链，直到遇到非单一子循环或循环体内还有其他语句
+/// @param outerMost
+/// @param band
 static void collectPerfectNestedBand(affine::AffineForOp outerMost,
                                      SmallVector<affine::AffineForOp, 8> &band) {
     band.clear();
@@ -90,6 +79,11 @@ static void collectPerfectNestedBand(affine::AffineForOp outerMost,
     }
 }
 
+/// @brief 尝试从 affine.for 的上下界（AffineMap）直接解析出常量迭代次数（extent），只在上下界和
+/// step 都是常量时返回有效数值。
+// 对符号/参数化/依赖 runtime 输入的循环会失败并回退到默认上界。
+/// @param loop
+/// @return
 static std::optional<int64_t> tryComputeConstantExtent(affine::AffineForOp loop) {
     int64_t step = 1;
     {
@@ -129,21 +123,6 @@ static std::vector<int64_t> getLayerExtentsFromAttributesOrFallback(
     std::vector<int64_t> extents;
     extents.resize(band.size(), fallbackExtentUpperBound);
 
-    affine::AffineForOp outerMost = band.front();
-    if (auto array = outerMost->getAttrOfType<ArrayAttr>("poly.extents")) {
-        if (array.size() == band.size()) {
-            for (size_t i = 0; i < band.size(); ++i) {
-                if (auto intAttr = array[i].dyn_cast<IntegerAttr>()) {
-                    int64_t v = intAttr.getInt();
-                    if (v > 0) {
-                        extents[i] = v;
-                    }
-                }
-            }
-            return extents;
-        }
-    }
-
     for (size_t i = 0; i < band.size(); ++i) {
         auto maybeExtent = tryComputeConstantExtent(band[i]);
         if (maybeExtent.has_value() && maybeExtent.value() > 0) {
@@ -171,49 +150,11 @@ static void getDependHintsFromAttributesOrFallback(const SmallVector<affine::Aff
     if (depth > 0) {
         layerWeights[depth - 1] += innermostBonus;
     }
-
-    affine::AffineForOp outerMost = band.front();
-    if (auto array = outerMost->getAttrOfType<ArrayAttr>("poly.depend.dirs")) {
-        if (array.size() == depth) {
-            for (size_t i = 0; i < depth; ++i) {
-                StringRef dir = "";
-                if (auto s = array[i].dyn_cast<StringAttr>()) {
-                    dir = s.getValue();
-                }
-                bool hasStrict = dir.contains('<') || dir.contains('>');
-                bool hasEqual = dir.contains('=');
-                if (hasStrict) {
-                    // 若存在严格方向, 收紧该层上界, 并减小权重.
-                    layerUpperCap[i] = std::min<int64_t>(layerUpperCap[i], 64);
-                    if (layerWeights[i] > 1) {
-                        layerWeights[i] -= 1;
-                    }
-                }
-                if (hasEqual) {
-                    // 方向为等号说明有复用, 提高权重.
-                    layerWeights[i] += 1;
-                }
-            }
-        }
-    }
 }
 
 /// 从属性 "poly.sm.coeffs" 中读取共享内存线性系数, 若不存在则回退为保守估计.
 static std::vector<int64_t> getSharedMemoryCoefficientsOrFallback(
-    const SmallVector<affine::AffineForOp, 8> &band,
-    /*输出*/ int64_t &baseBytes) {
-    affine::AffineForOp outerMost = band.front();
-    if (auto array = outerMost->getAttrOfType<ArrayAttr>("poly.sm.coeffs")) {
-        std::vector<int64_t> coeffs(array.size(), 0);
-        for (size_t i = 0; i < array.size(); ++i) {
-            if (auto ia = array[i].dyn_cast<IntegerAttr>()) {
-                coeffs[i] = ia.getInt();
-            }
-        }
-        baseBytes = 0;
-        return coeffs;
-    }
-
+    const SmallVector<affine::AffineForOp, 8> &band, int64_t &baseBytes) {
     // 回退: 在带内遍历 load/store, 对每个 memref 给出保守线性化系数.
     llvm::DenseSet<Value> visitedBuffers;
     baseBytes = 0;
@@ -305,7 +246,7 @@ static LogicalResult solveOneBandAndWriteAttribute(func::FuncOp functionOperatio
         model.AddLessOrEqual(sharedUsage, sharedMemoryLimitBytes);
     }
 
-    // 向量宽度约束: 最内层必须为向量宽度的整数倍(可选).
+    // 向量宽度约束: 最内层必须为向量宽度的整数倍.
     if (enforceVectorMultiple && depth > 0 && vectorWidth > 1) {
         int64_t innermostUpper = extentUpperBound[depth - 1];
         int64_t maximumQuotient = std::max<int64_t>(1, innermostUpper / vectorWidth);

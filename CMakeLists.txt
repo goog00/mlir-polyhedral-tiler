@@ -34,9 +34,11 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 add_library(GpuTileILPSelection MODULE 
         # src/GpuTileILPSelectionPass.cpp
+        src/GpuTileILPSelectionPass_v2.cpp
+        # src/dd.cpp
         # src/ApplyTileSizesPass.cpp 
         # src/BuildPolyRepresent.cpp
-        src/BuildPolyDepend.cpp
+        # src/BuildPolyDepend.cpp
         # src/ApplyTileSizes.cpp
       )
 
